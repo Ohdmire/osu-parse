@@ -1,0 +1,9 @@
+[package]
+name = "osu-parse"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared osu! file parsers: .osu beatmaps, .osb storyboards, .osr replays (line-accurate ports of osu!lazer decoders)"
+
+[dependencies]
+lzma-rs = "0.3.0"
