@@ -23,10 +23,7 @@ pub fn load_beatmap(map_path: &Path, strip_background: bool) -> Option<LoadedSto
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new(".").to_path_buf());
 
-    let mut story = match std::fs::read_to_string(map_path) {
-        Ok(text) => parser::parse(&text).ok()?,
-        Err(_) => return None,
-    };
+    let osu_text = std::fs::read_to_string(map_path).ok()?;
 
     // 谱组共用 .osb(目录下第一个;同组多份属于异常打包,取稳定序第一个)。
     let shared = std::fs::read_dir(&root)
@@ -43,28 +40,38 @@ pub fn load_beatmap(map_path: &Path, strip_background: bool) -> Option<LoadedSto
                 })
                 .collect::<Vec<_>>()
         })
-        .and_then(|paths| paths.into_iter().min_by(|a, b| a.file_name().cmp(&b.file_name())));
+        .and_then(|paths| paths.into_iter().min_by(|a, b| a.file_name().cmp(&b.file_name())))
+        .and_then(|p| std::fs::read_to_string(p).ok());
 
-    if let Some(shared) = shared {
+    let story = load_from_texts(&osu_text, shared.as_deref(), strip_background)?;
+    Some(LoadedStoryboard { story, root })
+}
+
+/// 从已读入的 `.osu` / `.osb` 文本合并 storyboard —— 零拷贝宿主用
+/// (osu!lazer 内容寻址库等没有真实谱面目录的场景,文件内容由宿主提供,
+/// 不落地复制)。合并与剔除规则与 [`load_beatmap`] 完全一致;两者都空
+/// 返回 `None`。`osb_text` 为 `None` 时只用 `.osu` 自身的 Events。
+pub fn load_from_texts(osu_text: &str, osb_text: Option<&str>, strip_background: bool) -> Option<Storyboard> {
+    let mut story = parser::parse(osu_text).ok()?;
+
+    if let Some(text) = osb_text {
         // 稳定版中谱面背景图由 .osb 接管:编辑器把背景写成 .osb 首个精灵并用
         // F,0,0,,0 隐藏,合并时跳过 .osu 的旧版背景行。
         if strip_background {
             story.elements.retain(|e| !e.sprite().always_visible);
         }
-        if let Ok(text) = std::fs::read_to_string(&shared) {
-            if let Ok(shared_story) = parser::parse(&text) {
-                story.elements.extend(shared_story.elements);
-                story.videos.extend(shared_story.videos);
-                story.samples.extend(shared_story.samples);
-                if story.widescreen.is_none() {
-                    story.widescreen = shared_story.widescreen;
-                }
+        if let Ok(shared_story) = parser::parse(text) {
+            story.elements.extend(shared_story.elements);
+            story.videos.extend(shared_story.videos);
+            story.samples.extend(shared_story.samples);
+            if story.widescreen.is_none() {
+                story.widescreen = shared_story.widescreen;
             }
         }
     }
 
     // 背景行剔除后可能再无元素(纯背景图谱面)——但视频元素仍值得返回
-    // (lazer 的 storyboard 含 Video 层;谱面可以只有视频没有精灵)。
+    //(lazer 的 storyboard 含 Video 层;谱面可以只有视频没有精灵)。
     if strip_background {
         story.elements.retain(|e| !e.sprite().always_visible);
     }
@@ -74,5 +81,5 @@ pub fn load_beatmap(map_path: &Path, strip_background: bool) -> Option<LoadedSto
     if story.widescreen.is_none() {
         story.widescreen = Some(true);
     }
-    Some(LoadedStoryboard { story, root })
+    Some(story)
 }
