@@ -332,9 +332,24 @@ fn sample_colour(cmds: &[Command], t: f32, default: [f32; 3]) -> [f32; 3] {
     value
 }
 
-/// 参数命令：处于任一命令时间区间内即激活。
+/// 参数命令（lazer `LegacyStoryboardDecoder`/`StoryboardBlendingParametersCommand`）：
+/// - 零时长（start==end，即 `P,...,,A` 空结束时间）：start=end=Additive，
+///   从命令时刻起永久生效；作为通道首条命令时经 `ApplyInitialValue`
+///   甚至先于其开始时间生效（"permanent effect regardless of time"）；
+/// - 有时长：仅 [start,end] 内生效，结束回退关闭（end=Inherit/false）。
+/// 后启动的命令覆盖先启动的。
 fn active(cmds: &[Command], t: f32) -> bool {
-    cmds.iter().any(|c| c.start_time <= t && t <= c.end_time && c.parameter().is_some())
+    let mut value = cmds.first().is_some_and(|c| c.end_time <= c.start_time && c.parameter().is_some());
+    for c in cmds {
+        if c.start_time > t {
+            break;
+        }
+        if c.parameter().is_none() {
+            continue;
+        }
+        value = c.end_time <= c.start_time || t <= c.end_time;
+    }
+    value
 }
 
 #[cfg(test)]
@@ -393,6 +408,27 @@ mod tests {
         assert!((s.x - 12.5).abs() < 1e-3, "{}", s.x);
         assert!(e.state_at(999.0).is_none());
         assert!((cs.duration - 1600.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn zero_duration_parameter_is_permanent() {
+        // triangles(yf_bmp)等真实 SB 的通用写法:`P,...,,A` 空结束时间 →
+        // 零时长命令,从命令时刻起永久加色。若按区间求值,黑底不透明
+        // JPEG(tri.jpg)会以普通混合渲染成移动的黑色矩形。
+        let cs = compile_one(
+            "Animation,Centre,\"x.png\",0,0,16,30,LoopOnce\n P,0,36014,,A\n M,0,36014,36514,0,0,100,100\n",
+        );
+        let e = &cs.elements[0];
+        assert!(e.state_at(36014.0).unwrap().additive);
+        assert!(e.state_at(36015.5).unwrap().additive, "零时长参数命令在命令时刻之后仍生效");
+        assert!(e.state_at(36514.0).unwrap().additive);
+    }
+
+    #[test]
+    fn zero_duration_parameter_applies_before_start_as_initial() {
+        // lazer ApplyInitialValue:通道首条零时长参数命令在元素创建时即生效
+        let cs = compile_one("Sprite,Centre,\"x.png\",0,0\n F,0,0,,1\n P,0,500,,A\n");
+        assert!(cs.elements[0].state_at(100.0).unwrap().additive);
     }
 
     #[test]
