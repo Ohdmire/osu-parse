@@ -183,10 +183,15 @@ impl Command {
     }
 }
 
-/// `L,startTime,totalIterations` 命令循环；子命令时间为相对循环起始的毫秒。
+/// `L,startTime,loopCount` 命令循环；子命令时间为相对循环起始的毫秒。
+/// `loopCount` 是循环体的**播放次数**：0 也播放一次（lazer
+/// LegacyStoryboardDecoder 对 `L,start,n` 传 `repeatCount = n - 1`、
+/// `TotalIterations = repeatCount + 1`,与 stable 一致——"Zero means a
+/// single playback")。
 #[derive(Debug, Clone)]
 pub struct CommandLoop {
     pub start_time: f32,
+    /// 循环体播放次数,恒 ≥ 1。
     pub total_iterations: u32,
     pub commands: Vec<Command>,
 }
@@ -254,6 +259,8 @@ pub struct Sample {
     pub time: f32,
     pub layer: i32,
     pub path: String,
+    /// 音量百分比(lazer:第 5 参,缺省 100)。
+    pub volume: f32,
 }
 
 #[derive(Debug, Clone, Default)]

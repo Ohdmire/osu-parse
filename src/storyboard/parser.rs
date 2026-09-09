@@ -145,6 +145,31 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
         if matches!(first_token.as_str(), "l" | "t") || !is_command_letter(&first_token) {
             let f = split_csv(trimmed);
             match first_token.as_str() {
+                // 旧版数字元素行(lazer LegacyEventType:Sprite=4 / Sample=5 /
+                // Animation=6,Enum.TryParse 数字与关键字同名)。osu!tutorial
+                // 等老图写的是 `4,0,1,"bg.jpg",x,y`。
+                "4" | "6" if f.len() >= 5 => {
+                    cur.flush_into(&mut sb);
+                    let is_animation = first_token == "6";
+                    // 数字行的层/原点是位置参数(层是 0-4 的数字)
+                    match parse_element_line(&f, is_animation, Layer::Background) {
+                        Ok((sprite, anim)) => {
+                            cur.sprite = Some(sprite);
+                            cur.is_animation = is_animation;
+                            cur.anim = anim;
+                        }
+                        Err(e) => sb.warnings.push(format!("跳过元素行 “{trimmed}”: {e}")),
+                    }
+                }
+                "5" if f.len() >= 4 => {
+                    cur.flush_into(&mut sb);
+                    sb.samples.push(Sample {
+                        time: parse_f32(&f[1]).unwrap_or(0.0),
+                        layer: parse_f32(&f[2]).unwrap_or(0.0) as i32,
+                        path: f[3].clone(),
+                        volume: f.get(4).and_then(|v| parse_f32(v)).unwrap_or(100.0),
+                    });
+                }
                 "sprite" | "animation" => {
                     cur.flush_into(&mut sb);
                     match parse_element_line(&f, first_token == "animation", current_layer) {
@@ -163,6 +188,7 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
                             time: parse_f32(&f[1]).unwrap_or(0.0),
                             layer: parse_f32(&f[2]).unwrap_or(0.0) as i32,
                             path: f[3].clone(),
+                            volume: f.get(4).and_then(|v| parse_f32(v)).unwrap_or(100.0),
                         });
                     } else {
                         sb.warnings.push(format!("Sample 行参数不足: {trimmed}"));
@@ -178,10 +204,19 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
                     if cur.sprite.is_some() {
                         cur.flush_group();
                         let start = f.get(1).and_then(|s| parse_f32(s)).unwrap_or(0.0);
-                        let count = f.get(2).and_then(|s| parse_f32(s)).unwrap_or(1.0).max(0.0) as u32;
+                        // L,start,count 的 count 是播放次数而非重复次数:
+                        // 0 表示播放一次(lazer 传 repeatCount=count-1、
+                        // TotalIterations=repeat+1,stable 同)。存原始 0 会让
+                        // 循环体完全不执行,精灵落到"无命令常驻"分支,
+                        // 以默认变换永久显示(My Love 的巨大字幕残留即此因)。
+                        let count = f
+                            .get(2)
+                            .and_then(|s| parse_f32(s))
+                            .unwrap_or(1.0)
+                            .max(0.0) as u32;
                         cur.group = Some(Group::Loop(CommandLoop {
                             start_time: start.max(0.0),
-                            total_iterations: count,
+                            total_iterations: count.max(1),
                             commands: Vec::new(),
                         }));
                     }
@@ -494,6 +529,72 @@ mod tests {
         assert_eq!(s.commands[0].start_time, 500.0);
         assert_eq!(s.commands[0].end_time, 500.0);
         assert_eq!(s.commands[1].effect, Effect::Move { from: [320.0, 240.0], to: [320.0, 240.0] });
+    }
+
+    #[test]
+    fn numeric_element_lines_parse() {
+        // osu!tutorial 的旧版数字行:4=Sprite 5=Sample 6=Animation,
+        // 层/原点也是位置数字(lazer LegacyEventType 枚举数字同名)。
+        let sb = parse(
+            "4,0,1,\"bg.jpg\",320,264
+              5,1000,0,\"sectionpass.mp3\"
+              6,0,1,\"anim.png\",320,240,2,75,LoopForever
+",
+        )
+        .unwrap();
+        assert_eq!(sb.elements.len(), 2, "Sprite + Animation");
+        assert_eq!(sb.elements[0].sprite().layer, Layer::Background);
+        assert_eq!(sb.elements[0].sprite().origin, Origin::Centre);
+        assert_eq!(sb.elements[0].sprite().path, "bg.jpg");
+        assert_eq!(sb.samples.len(), 1, "数字 Sample 行");
+        assert_eq!(sb.samples[0].path, "sectionpass.mp3");
+    }
+
+    #[test]
+    fn bare_sprite_never_drawn() {
+        // lazer 语义:无任何命令的精灵(空命令组 StartTime=MaxValue/
+        // EndTimeForDisplay=MinValue)永不存活、永不绘制——
+        // world.execute(me); 的裸背景副本因此表现为纯黑背景。
+        let sb = parse("Sprite,Background,Centre,\"bg.jpg\",0,0
+").unwrap();
+        let compiled = crate::storyboard::timeline::CompiledStoryboard::compile(sb);
+        assert!(
+            compiled.elements[0].state_at(0.0).is_none()
+                && compiled.elements[0].state_at(100_000.0).is_none(),
+            "无命令精灵在任意时刻都不可见"
+        );
+    }
+
+    #[test]
+    fn loop_count_zero_plays_once() {
+        // My Love(1388906)的写法:L,start,0 —— count 是播放次数,
+        // 0 = 单次播放(lazer LegacyStoryboardDecoder: repeatCount=count-1、
+        // TotalIterations=repeat+1)。存 0 会让循环体不执行,精灵落到
+        // "无命令常驻"分支,以默认变换永久显示。
+        let sb = parse(
+            "Sprite,Background,Centre,\"big.png\",320,240\n \
+             L,11630,0\n  S,0,0,,0.5\n  F,0,0,343,0,1\n  F,0,343,7886,1,0\n",
+        )
+        .unwrap();
+        let s = sb.elements[0].sprite();
+        assert_eq!(s.loops.len(), 1);
+        assert_eq!(s.loops[0].total_iterations, 1, "count 0 = 播放一次");
+        assert_eq!(s.loops[0].commands.len(), 3);
+
+        // 时间线上必须真的展开出这条循环的命令:11628ms 处精灵应因循环内
+        // F(0→1) 尚未开始而不可见(lazer 语义:首个 F 命令从其起始值生效),
+        // 若循环被跳过,精灵会以 alpha 1 常驻 → state_at 在任意时刻都返回 Some
+        let compiled = crate::storyboard::timeline::CompiledStoryboard::compile(sb);
+        let sprite = &compiled.elements[0];
+        let before = sprite.state_at(11628.0).map(|st| st.alpha);
+        assert!(
+            before.map_or(true, |a| a <= 0.001),
+            "循环展开后 11630ms 前不可见(state_at={before:?}),常驻即循环未展开"
+        );
+        let during = sprite.state_at(12000.0).map(|st| (st.alpha, st.scale_x));
+        let (alpha, scale) = during.expect("12000ms 时循环正在播放,精灵必须可见");
+        assert!(alpha > 0.99, "循环内 F(0→1) 应已到 1,实际 {alpha}");
+        assert!((scale - 0.5).abs() < 1e-4, "循环内 S=0.5 应生效,实际 {scale}");
     }
 
     #[test]

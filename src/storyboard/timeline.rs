@@ -158,7 +158,7 @@ pub struct CompiledStoryboard {
     pub total_commands: usize,
     pub loop_iterations: usize,
     pub videos: usize,
-    pub samples: usize,
+    pub samples: Vec<crate::storyboard::model::Sample>,
     /// WidescreenStoryboard：true = 640×480 向两侧扩展；false = 固定 4:3（宽窗口加黑边）。
     pub widescreen: bool,
 }
@@ -212,12 +212,18 @@ impl CompiledStoryboard {
                     end = end.max(c.end_time);
                 }
             }
-            if sprite.always_visible || count == 0 {
-                // 旧行背景常驻;无任何命令(含循环)的精灵同样常驻——
-                // osu! 语义:命令全空的 Sprite 以声明位置、alpha 1 永久
-                // 显示(.osb 接管背景时编辑器写的就是这种裸精灵)。
+            if sprite.always_visible {
+                // 旧版背景行(0,0,"bg.jpg"):宿主把它当作谱面背景绘制,
+                // 独立播放器里也常驻显示。
                 start = 0.0;
                 end = f32::INFINITY;
+            } else if count == 0 {
+                // 无任何命令的精灵:lazer 的空命令组 StartTime=MaxValue、
+                // EndTimeForDisplay=MinValue,ShouldBeAlive 永远为 false,
+                // **从不绘制**(world.execute(me); 的裸背景副本 → 纯黑背景,
+                // 与 stable 的"裸精灵永久铺底"不同——以 lazer 为准)。
+                start = f32::INFINITY;
+                end = f32::NEG_INFINITY;
             }
             if end.is_finite() {
                 duration = duration.max(end);
@@ -257,7 +263,7 @@ impl CompiledStoryboard {
             total_commands,
             loop_iterations,
             videos: sb.videos.len(),
-            samples: sb.samples.len(),
+            samples: sb.samples,
             widescreen: sb.widescreen.unwrap_or(true),
         }
     }
