@@ -41,6 +41,10 @@ impl SampleBank {
 pub struct SamplePoint {
     pub time: f64,
     pub bank: SampleBank,
+    /// Custom sample bank index (`sampleIndex`, the line's 5th field).
+    /// ≥1 opts the point's objects into the beatmap's own sample files;
+    /// ≥2 adds the numeric suffix to lookups (`normal-hitnormal2`).
+    pub custom_index: i32,
     /// 0-100.
     pub volume: i32,
 }
@@ -53,8 +57,14 @@ pub struct SampleBankInfo {
     pub normal: Option<SampleBank>,
     /// Bank for additions; `None` = same as `normal`.
     pub additions: Option<SampleBank>,
+    /// Custom sample bank index (`customIndex`, the hitSample's 3rd
+    /// field); 0 = inherit from the control point.
+    pub custom_index: i32,
     /// 0-100; 0 = inherit from the control point.
     pub volume: i32,
+    /// Explicit sample filename (the hitSample's 5th field): replaces the
+    /// hitnormal slot with this beatmap-local file (`FileHitSampleInfo`).
+    pub filename: Option<String>,
 }
 
 /// Sample-side view of one hit object.
@@ -84,7 +94,8 @@ pub struct SampleData {
 }
 
 /// `readCustomSampleBanks`. `banks_only` mirrors the slider object-level
-/// call, where the trailing hitSample contributes banks but no volume.
+/// call, where the trailing hitSample contributes banks only (lazer
+/// returns before the customIndex/volume/filename fields).
 fn read_custom_sample_banks(s: &str, info: &mut SampleBankInfo, banks_only: bool) {
     let split: Vec<&str> = s.split(':').collect();
     let parse = |v: Option<&&str>| -> i64 {
@@ -93,8 +104,20 @@ fn read_custom_sample_banks(s: &str, info: &mut SampleBankInfo, banks_only: bool
     info.normal = SampleBank::from_legacy(parse(split.first()));
     let add = SampleBank::from_legacy(parse(split.get(1)));
     info.additions = add.or(info.normal);
-    if !banks_only && split.len() > 3 {
+    if banks_only {
+        return;
+    }
+    if split.len() > 2 {
+        info.custom_index = parse(split.get(2)).clamp(0, i32::MAX as i64) as i32;
+    }
+    if split.len() > 3 {
         info.volume = parse(split.get(3)).max(0) as i32;
+    }
+    if split.len() > 4 {
+        let file = split[4].trim();
+        if !file.is_empty() {
+            info.filename = Some(file.to_string());
+        }
     }
 }
 
@@ -155,7 +178,17 @@ pub fn parse(content: &str) -> SampleData {
                     .and_then(|s| s.trim().parse::<i64>().ok())
                     .unwrap_or(default_volume as i64)
                     .clamp(0, 100) as i32;
-                let point = SamplePoint { time, bank, volume };
+                // Field 5 (`sampleIndex`): the point's custom sample bank
+                // index — ≥1 opts objects under this point into the
+                // beatmap's own sample files, ≥2 adds the numeric suffix
+                // (`normal-hitnormal2`). [General] has no equivalent
+                // default; absent means 0.
+                let custom_index = split
+                    .get(4)
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0)
+                    .clamp(0, i32::MAX as i64) as i32;
+                let point = SamplePoint { time, bank, custom_index, volume };
                 // Same-time lines: the last one wins (control point groups
                 // replace, non-redundant later additions override).
                 if points.last().map(|p| p.time == time).unwrap_or(false) {
