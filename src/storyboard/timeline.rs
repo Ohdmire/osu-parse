@@ -72,9 +72,13 @@ impl Channels {
     }
 
     fn finish(&mut self) {
-        let by_start = |a: &Command, b: &Command| {
-            a.start_time.total_cmp(&b.start_time).then(b.end_time.total_cmp(&a.end_time))
-        };
+        // 仅按开始时间排序,同刻命令保持声明序(稳定排序)。osu/lazer 对
+        // 同一通道按声明顺序依次应用,后声明者覆盖先者 —— 此前附加的
+        // end DESC 平局裁决会把"无结束时间的保持命令"(end=start)排到
+        // 同刻长命令之后求值,把进行中的补间整体钳回保持值:
+        // F,1,t0,t1,1,0(声明在后)被 F,0,t0,,1(保持)覆盖,淡出永不生效,
+        // 精灵直到生命周期结束瞬间消失(white.jpg 闪白即此)。
+        let by_start = |a: &Command, b: &Command| a.start_time.total_cmp(&b.start_time);
         self.alpha.sort_by(by_start);
         self.pos_x.sort_by(by_start);
         self.pos_y.sort_by(by_start);
