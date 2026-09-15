@@ -349,8 +349,15 @@ fn parse_command(line: &str, warnings: &mut Vec<String>) -> Option<Command> {
     let num = |i: usize| -> Option<f32> { f.get(i).and_then(|s| parse_f32(s)) };
     let easing = num(1).map(|v| Easing::from_id(v as i32)).unwrap_or(Easing::LINEAR);
     let start = num(2).unwrap_or(0.0).max(0.0);
-    let end = num(3).unwrap_or(start).max(0.0);
-    let (start, end) = if end < start { (end, start) } else { (start, end) };
+    let mut end = num(3).unwrap_or(start).max(0.0);
+    // lazer `StoryboardCommand`:endTime < startTime 时钳 endTime = startTime
+    //(零时长命令),不是交换。交换会把 end<start 的笔误变成从 0ms 起的长
+    // 命令:Kuusou Ressha(1128531) sb\8/9.png 的 `F,0,39852,1,0`(结束
+    // 时间漏写、1 是起始值)交换成 [1,39852] 的 0→0 后,其结束值 0 又被
+    // 同通道更晚结束的 F,0,37109,39852,1 覆盖,文字 39.8s 后永久残留。
+    if end < start {
+        end = start;
+    }
 
     // 数值成对（from/to），缺失一侧时用另一侧补齐
     let pair = |a: Option<f32>, b: Option<f32>| -> Option<(f32, f32)> {

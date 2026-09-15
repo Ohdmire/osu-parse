@@ -192,8 +192,9 @@ impl CompiledStoryboard {
                         let mut a = c.clone();
                         a.start_time = (a.start_time + offset).max(0.0);
                         a.end_time = (a.end_time + offset).max(0.0);
+                        // 同 parser:end < start 钳为零时长(lazer 语义),不交换
                         if a.end_time < a.start_time {
-                            std::mem::swap(&mut a.start_time, &mut a.end_time);
+                            a.end_time = a.start_time;
                         }
                         ch.push(&a);
                         count += 1;
@@ -276,8 +277,10 @@ impl CompiledStoryboard {
 fn clamp_positive(mut c: Command) -> Command {
     c.start_time = c.start_time.max(0.0);
     c.end_time = c.end_time.max(0.0);
+    // 同 parser:end < start 钳为零时长(lazer `StoryboardCommand` 语义),
+    // 不交换 —— 交换会拉长命令窗口并前移生命周期起点
     if c.end_time < c.start_time {
-        std::mem::swap(&mut c.start_time, &mut c.end_time);
+        c.end_time = c.start_time;
     }
     c
 }
@@ -525,5 +528,40 @@ mod tests {
             compile_one("Sprite,Centre,\"x.png\",0,0\n F,0,0,,1\n C,0,5000,6000,255,0,0,0,255,0\n");
         let s = cs.elements[0].state_at(100.0).unwrap();
         assert!(s.colour[0] > 0.99 && s.colour[1].abs() < 1e-6, "{:?}", s.colour);
+    }
+
+    /// Kuusou Ressha(bid 1128531)sb\8/9.png 的实际写法:淡出行
+    /// `F,0,39852,1,0` 的结束时间字段误写为 1(end < start)。
+    /// lazer `StoryboardCommand` 钳 end=start 成零时长命令,alpha 立即
+    /// 归 0;若交换 start/end,则变成 [1,39852] 的 0→0,结束值 0 被
+    /// 同通道更晚结束的 F,0,37109,39852,1 覆盖,文字 39.8s 后一直
+    /// 显示到谱末 —— 即"35s 处的文字没有正确消失"。
+    #[test]
+    fn end_before_start_clamps_to_zero_duration() {
+        let cs = compile_one(
+            "Sprite,Foreground,Centre,\"sb/8.png\",320,225\n \
+             S,0,37109,,0.33\n \
+             F,0,37109,39852,1\n \
+             F,0,39852,1,0\n \
+             F,0,237337,241451,1\n",
+        );
+        let e = &cs.elements[0];
+        assert!(
+            (e.start - 37109.0).abs() < 1e-3,
+            "生命周期起点不得被交换前移到 1ms: {}",
+            e.start
+        );
+        assert!(e.state_at(38000.0).unwrap().alpha > 0.99, "37.1..39.85s 应可见");
+        assert!(
+            e.state_at(40000.0).map_or(true, |s| s.alpha <= 0.001),
+            "39852ms 瞬时命令后应消失,实际 {:?}",
+            e.state_at(40000.0).map(|s| s.alpha)
+        );
+        assert!(e.state_at(239000.0).unwrap().alpha > 0.99, "237.3s 复现段应可见");
+        // 对照:结束时间留空的正确写法(F,0,t,,1,0)不受影响
+        let cs = compile_one("Sprite,Centre,\"x.png\",0,0\n F,0,1000,2000,1\n F,0,2000,,1,0\n");
+        let e = &cs.elements[0];
+        assert!(e.state_at(1999.0).unwrap().alpha > 0.99);
+        assert!(e.state_at(2001.0).map_or(true, |s| s.alpha <= 0.001));
     }
 }
