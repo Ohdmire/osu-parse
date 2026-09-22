@@ -109,6 +109,11 @@ pub struct CompiledElement {
     pub always_visible: bool,
     pub start: f32,
     pub end: f32,
+    /// 最早命令时间(lazer `EarliestTransformTime`:顶层命令最早与各循环
+    /// 组头时间的最小值)。动画帧的播放位置以此为基准
+    /// (`PlaybackPosition = time - EarliestTransformTime`),与显示用的
+    /// `start`(含 alpha 可见性特例)分开。
+    pub earliest: f32,
     pub trigger_count: usize,
     ch: Channels,
 }
@@ -123,7 +128,7 @@ impl CompiledElement {
         // 之前钳制为起始值，因此某通道首条命令开始前，属性 = 首条命令的起始值；
         // Sprite 行声明的 x/y 仅在该通道没有任何命令时生效。
         let [dx, dy] = self.start_pos;
-        Some(SpriteState {
+        let mut state = SpriteState {
             x: sample_f32(&self.ch.pos_x, t, initial(&self.ch.pos_x, |c| c.x(), dx), |c| c.x()),
             y: sample_f32(&self.ch.pos_y, t, initial(&self.ch.pos_y, |c| c.y(), dy), |c| c.y()),
             scale_x: sample_f32(&self.ch.scale_x, t, initial(&self.ch.scale_x, |c| c.scale_x(), 1.0), |c| c.scale_x()),
@@ -134,17 +139,26 @@ impl CompiledElement {
             flip_h: active(&self.ch.flip_h, t),
             flip_v: active(&self.ch.flip_v, t),
             additive: active(&self.ch.additive, t),
-        })
+        };
+        // lazer 闪烁技法:alpha 超过 1 时按 1 取模(stable 同源行为,
+        // `if (Alpha > 1) Alpha %= 1`)。F 值写到 >1 的谱面靠它制造闪烁。
+        if state.alpha > 1.0 {
+            state.alpha %= 1.0;
+        }
+        Some(state)
     }
 
     /// 动画当前帧索引（帧图片路径 = 路径去扩展名 + 索引 + 扩展名）。
+    /// 播放位置以 [`Self::earliest`](lazer `EarliestTransformTime`)为
+    /// 基准:`PlaybackPosition = time - EarliestTransformTime`。
     pub fn frame_at(&self, t: f32) -> usize {
         let Some(a) = &self.animation else { return 0 };
         let count = a.frame_count.max(1) as i64;
+        let local = (t - self.earliest).max(0.0);
         let idx = if a.frame_delay <= 0.0 {
             0
         } else {
-            (t / a.frame_delay).floor() as i64
+            (local / a.frame_delay).floor() as i64
         };
         let idx = match a.loop_type {
             LoopType::LoopOnce => idx.clamp(0, count - 1),
@@ -205,6 +219,17 @@ impl CompiledStoryboard {
 
             let trigger_count = sprite.triggers.iter().map(|t| t.commands.len()).sum::<usize>();
 
+            // lazer `EarliestTransformTime`:顶层命令最早与各循环组头
+            // (loopStartTime,不含命令相对偏移)的最小值。动画帧基准。
+            let mut earliest = f32::MAX;
+            for c in &sprite.commands {
+                earliest = earliest.min(c.start_time.max(0.0));
+            }
+            for l in &sprite.loops {
+                earliest = earliest.min(l.start_time);
+            }
+
+            ch.finish();
             let mut start = f32::MAX;
             let mut end = f32::MIN;
             let all: [&[Command]; 10] = [
@@ -229,12 +254,25 @@ impl CompiledStoryboard {
                 // 与 stable 的"裸精灵永久铺底"不同——以 lazer 为准)。
                 start = f32::INFINITY;
                 end = f32::NEG_INFINITY;
+            } else if !ch.alpha.is_empty() {
+                // lazer `StoryboardSprite.StartTime` 的 alpha 可见性特例:
+                // 最早 alpha 命令从不可见(StartValue==0)起步时,元素出现
+                // 时间推迟到第一条可见 alpha 命令(StartValue>0 或
+                // EndValue>0)的开始时刻(仅影响显示时机,lazer 用于生命周期
+                // 优化;此处同样应用于可见窗口,与 LifetimeStart 一致)。
+                let first_alpha = &ch.alpha[0];
+                if first_alpha.alpha().map_or(false, |(from, _)| from == 0.0) {
+                    if let Some(first_visible) = ch.alpha.iter().find(|c| {
+                        c.alpha().map_or(false, |(from, to)| from > 0.0 || to > 0.0)
+                    }) {
+                        start = first_visible.start_time;
+                    }
+                }
             }
             if end.is_finite() {
                 duration = duration.max(end);
             }
             total_commands += count;
-            ch.finish();
 
             let animation = match &element {
                 Element::Animation(a) => Some(AnimationInfo {
@@ -254,6 +292,7 @@ impl CompiledStoryboard {
                 always_visible: sprite.always_visible,
                 start,
                 end,
+                earliest,
                 trigger_count,
                 ch,
             });
@@ -269,7 +308,7 @@ impl CompiledStoryboard {
             loop_iterations,
             videos: sb.videos.len(),
             samples: sb.samples,
-            widescreen: sb.widescreen.unwrap_or(true),
+            widescreen: sb.widescreen.unwrap_or(false),
         }
     }
 }
@@ -487,6 +526,64 @@ mod tests {
         assert_eq!(layers, vec![Layer::Background, Layer::Background, Layer::Foreground]);
         assert_eq!(cs.elements[0].path, "b.png"); // 层内保持文件顺序
         assert_eq!(cs.elements[1].path, "c.png");
+    }
+
+    /// lazer 动画帧基准 = EarliestTransformTime:帧索引按
+    /// (t - 最早命令时间)/帧延迟 计算,而不是从 0 开始。
+    #[test]
+    fn animation_frames_relative_to_earliest_transform() {
+        let cs = compile_one(
+            "Animation,Centre,\"a.png\",0,0,8,90,LoopForever\n F,0,5000,60000,1,1\n",
+        );
+        let e = &cs.elements[0];
+        // t=5090 → 局部 90ms → 第 1 帧;旧的"从 0 起算"会得到 5090/90%8=0
+        assert_eq!(e.frame_at(5090.0), 1);
+        assert_eq!(e.frame_at(5000.0), 0);
+        // 循环组头也是基准候选:首条命令在循环内 200ms 处,组头 1000ms
+        let cs = compile_one(
+            "Animation,Centre,\"a.png\",0,0,4,100,LoopForever\n L,1000,2\n  _F,0,200,400,1,1\n",
+        );
+        let e = &cs.elements[0];
+        assert_eq!(e.frame_at(1000.0), 0);
+        assert_eq!(e.frame_at(1150.0), 1, "局部 150ms → 第 1 帧");
+    }
+
+    /// lazer `StoryboardSprite.StartTime` 的 alpha 特例:首条 alpha 从
+    /// 不可见起步(StartValue==0)时,元素推迟到第一条可见 alpha 命令出现。
+    #[test]
+    fn invisible_start_alpha_defers_appearance() {
+        let cs = compile_one(
+            "Sprite,Centre,\"x.png\",0,0\n S,0,0,1000,0,2\n F,0,5000,6000,0,1\n",
+        );
+        let e = &cs.elements[0];
+        assert!(
+            e.state_at(2000.0).is_none(),
+            "alpha 0 起步 + 淡入在 5s:2s 处不应出现(earliest={})",
+            e.earliest
+        );
+        assert!(e.state_at(5000.0).is_some(), "5s 淡入开始后可见");
+        // 对照:首条 alpha 起始值可见 → 按全通道最早命令出现
+        let cs = compile_one(
+            "Sprite,Centre,\"x.png\",0,0\n S,0,0,1000,0,2\n F,0,5000,6000,1,1\n",
+        );
+        assert!(cs.elements[0].state_at(100.0).is_some(), "可见起步 → S 期间就出现");
+    }
+
+    /// lazer 闪烁技法:F 值超过 1 时按 1 取模。
+    #[test]
+    fn alpha_above_one_wraps() {
+        let cs = compile_one("Sprite,Centre,\"x.png\",0,0\n F,0,0,1000,1.5,2.5\n");
+        let e = &cs.elements[0];
+        assert!((e.state_at(0.0).unwrap().alpha - 0.5).abs() < 1e-4, "1.5 % 1 = 0.5");
+        assert!((e.state_at(500.0).unwrap().alpha - 0.0).abs() < 1e-4, "2.0 % 1 = 0");
+        assert!((e.state_at(1000.0).unwrap().alpha - 0.5).abs() < 1e-4, "2.5 % 1 = 0.5");
+    }
+
+    /// lazer beatmap 的 WidescreenStoryboard 缺省为 false。
+    #[test]
+    fn widescreen_defaults_false() {
+        let cs = compile_one("Sprite,Centre,\"x.png\",0,0\n F,0,0,10,1,1\n");
+        assert!(!cs.widescreen, "缺省应为 4:3");
     }
 
     #[test]
