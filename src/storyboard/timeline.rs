@@ -115,7 +115,40 @@ pub struct CompiledElement {
     /// `start`(含 alpha 可见性特例)分开。
     pub earliest: f32,
     pub trigger_count: usize,
+    triggers: Vec<CompiledTrigger>,
     ch: Channels,
+}
+
+/// 一条 `T` 组。命令时间相对触发时刻（`BeginDelayedSequence`）。
+#[derive(Debug, Clone)]
+pub struct CompiledTrigger {
+    pub name: String,
+    pub start: f32,
+    pub end: f32,
+    pub commands: Vec<Command>,
+}
+
+/// 游戏事件。窗口内才会激活对应的 `T` 组。
+#[derive(Debug, Clone)]
+pub struct TriggerEvent {
+    pub time: f32,
+    pub kind: TriggerKind,
+}
+
+/// 同一次 `PlaySamples` 里的一条 `HitSampleInfo`。
+#[derive(Debug, Clone)]
+pub struct PlayedHit {
+    pub name: String,
+    pub bank: String,
+    pub suffix: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TriggerKind {
+    Passing,
+    Failing,
+    HitObjectHit,
+    Samples(Vec<PlayedHit>),
 }
 
 impl CompiledElement {
@@ -166,6 +199,37 @@ impl CompiledElement {
         };
         idx as usize
     }
+
+    /// 把窗口内发生的事件展开成绝对时间命令。
+    /// `StoryboardTriggerController.playTrigger`：`ActiveAt` 为真时，
+    /// 每条命令 `BeginDelayedSequence(command.StartTime)`，即触发时刻
+    /// 加上命令自身的时间。调用一次后触发器清空，重复调用无效果。
+    pub fn apply_triggers(&mut self, events: &[TriggerEvent]) {
+        let triggers = std::mem::take(&mut self.triggers);
+        if triggers.is_empty() || events.is_empty() {
+            return;
+        }
+        for trig in &triggers {
+            for ev in events {
+                if ev.time < trig.start || ev.time > trig.end {
+                    continue;
+                }
+                if !trigger_matches(&trig.name, &ev.kind) {
+                    continue;
+                }
+                for c in &trig.commands {
+                    let mut a = c.clone();
+                    a.start_time = (a.start_time + ev.time).max(0.0);
+                    a.end_time = (a.end_time + ev.time).max(0.0);
+                    if a.end_time < a.start_time {
+                        a.end_time = a.start_time;
+                    }
+                    self.ch.push(&clamp_positive(a));
+                }
+            }
+        }
+        self.ch.finish();
+    }
 }
 
 pub struct CompiledStoryboard {
@@ -198,8 +262,12 @@ impl CompiledStoryboard {
                 count += 1;
             }
             for l in &sprite.loops {
-                // 循环单次迭代时长 = 组内最长命令结束时间（相对值）
-                let iter_dur = l.commands.iter().map(|c| c.end_time).fold(0.0f32, f32::max);
+                // lazer `StoryboardLoopingGroup.Duration` = EndTime - StartTime
+                // （相对时间的最晚结束减最早开始）。命令都从 0 开始时等于
+                // 最晚结束；否则按 End-Start 作为 LoopDelay。
+                let min_start = l.commands.iter().map(|c| c.start_time).fold(f32::MAX, f32::min);
+                let max_end = l.commands.iter().map(|c| c.end_time).fold(f32::MIN, f32::max);
+                let iter_dur = if l.commands.is_empty() { 0.0 } else { (max_end - min_start).max(0.0) };
                 for i in 0..l.total_iterations {
                     let offset = l.start_time + iter_dur * i as f32;
                     for c in &l.commands {
@@ -218,6 +286,16 @@ impl CompiledStoryboard {
             }
 
             let trigger_count = sprite.triggers.iter().map(|t| t.commands.len()).sum::<usize>();
+            let triggers = sprite
+                .triggers
+                .iter()
+                .map(|t| CompiledTrigger {
+                    name: t.trigger_name.clone(),
+                    start: t.start_time,
+                    end: t.end_time,
+                    commands: t.commands.clone(),
+                })
+                .collect();
 
             // lazer `EarliestTransformTime`:顶层命令最早与各循环组头
             // (loopStartTime,不含命令相对偏移)的最小值。动画帧基准。
@@ -294,6 +372,7 @@ impl CompiledStoryboard {
                 end,
                 earliest,
                 trigger_count,
+                triggers,
                 ch,
             });
         }
@@ -404,6 +483,97 @@ fn active(cmds: &[Command], t: f32) -> bool {
     value
 }
 
+/// `StoryboardTriggerController.Bind` 的名字分发，加上
+/// `HitSampleTriggerDefinition.Matches`。
+fn trigger_matches(trigger_name: &str, kind: &TriggerKind) -> bool {
+    match kind {
+        TriggerKind::Passing => trigger_name.eq_ignore_ascii_case("Passing"),
+        TriggerKind::Failing => trigger_name.eq_ignore_ascii_case("Failing"),
+        TriggerKind::HitObjectHit => trigger_name.eq_ignore_ascii_case("HitObjectHit"),
+        TriggerKind::Samples(samples) => hit_sound_matches(trigger_name, samples),
+    }
+}
+
+struct HitSoundDef {
+    addition_name: Option<String>,
+    normal_bank: Option<String>,
+    addition_bank: Option<String>,
+    suffix: Option<String>,
+}
+
+fn hit_sound_matches(trigger_name: &str, samples: &[PlayedHit]) -> bool {
+    let Some(def) = parse_hit_sound(trigger_name) else { return false };
+    let mut found_addition = def.addition_name.is_none();
+    let mut addition_bank_ok = def.addition_bank.is_none();
+    for sample in samples {
+        if sample.name.eq_ignore_ascii_case("hitnormal") {
+            if def.normal_bank.as_ref().is_some_and(|b| !sample.bank.eq_ignore_ascii_case(b)) {
+                return false;
+            }
+        } else {
+            if def.addition_name.as_ref().is_some_and(|n| sample.name.eq_ignore_ascii_case(n)) {
+                found_addition = true;
+            }
+            if def.addition_bank.as_ref().is_some_and(|b| sample.bank.eq_ignore_ascii_case(b)) {
+                addition_bank_ok = true;
+            }
+        }
+        if def.suffix.as_ref().is_some_and(|s| sample.suffix.as_deref() != Some(s.as_str())) {
+            return false;
+        }
+    }
+    found_addition && addition_bank_ok
+}
+
+/// `(?i)^HitSound(All|Normal|Soft|Drum)?(All|Normal|Soft|Drum)?(Whistle|Clap|Finish)?(\d+)?$`
+fn parse_hit_sound(trigger_name: &str) -> Option<HitSoundDef> {
+    let rest = trigger_name.get(8..)?;
+    if !trigger_name[..8].eq_ignore_ascii_case("hitsound") {
+        return None;
+    }
+    let mut rest = rest;
+    let bank1 = take_alt(&mut rest, &["all", "normal", "soft", "drum"]);
+    let bank2 = take_alt(&mut rest, &["all", "normal", "soft", "drum"]);
+    let name = take_alt(&mut rest, &["whistle", "clap", "finish"]);
+    let suffix = if rest.is_empty() {
+        None
+    } else if rest.bytes().all(|b| b.is_ascii_digit()) {
+        Some(rest.to_string())
+    } else {
+        return None;
+    };
+    let bank1_is_addition = bank1.is_some() && bank2.is_none() && name.is_some();
+    let map_bank = |b: Option<&str>| match b {
+        Some("normal") => Some("normal".to_string()),
+        Some("soft") => Some("soft".to_string()),
+        Some("drum") => Some("drum".to_string()),
+        _ => None,
+    };
+    let addition_name = match name {
+        Some("whistle") => Some("hitwhistle".to_string()),
+        Some("clap") => Some("hitclap".to_string()),
+        Some("finish") => Some("hitfinish".to_string()),
+        _ => None,
+    };
+    Some(HitSoundDef {
+        addition_name,
+        normal_bank: map_bank(if bank1_is_addition { None } else { bank1 }),
+        addition_bank: map_bank(if bank1_is_addition { bank1 } else { bank2 }),
+        suffix,
+    })
+}
+
+fn take_alt<'a>(rest: &mut &'a str, alts: &[&'static str]) -> Option<&'static str> {
+    let lower = rest.to_ascii_lowercase();
+    for alt in alts {
+        if lower.starts_with(alt) {
+            *rest = &rest[alt.len()..];
+            return Some(*alt);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +615,37 @@ mod tests {
         assert!((s.y - 75.0).abs() < 1e-3, "M 继续驱动 y: {}", s.y);
         let s = e.state_at(250.0).unwrap();
         assert!((s.x - 25.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn hit_sound_soft_whistle_matches_addition_bank() {
+        let samples = vec![PlayedHit {
+            name: "hitnormal".into(),
+            bank: "normal".into(),
+            suffix: None,
+        }, PlayedHit {
+            name: "hitwhistle".into(),
+            bank: "soft".into(),
+            suffix: None,
+        }];
+        assert!(hit_sound_matches("HitSoundSoftWhistle", &samples));
+        assert!(!hit_sound_matches("HitSoundDrumWhistle", &samples));
+        assert!(trigger_matches("Passing", &TriggerKind::Passing));
+        assert!(!trigger_matches("Passing", &TriggerKind::Failing));
+    }
+
+    #[test]
+    fn loop_period_is_end_minus_start() {
+        let cs = compile_one(
+            "Sprite,Centre,\"x.png\",0,0\n L,1000,2\n  M,0,100,200,0,0,10,0\n",
+        );
+        let e = &cs.elements[0];
+        // Duration = 200-100 = 100. Iteration starts: 1000+100, 1100+100.
+        let s = e.state_at(1150.0).unwrap();
+        assert!((s.x - 5.0).abs() < 1e-2, "mid first iteration");
+        // 周期 100 而不是最晚结束 200：1250 落在第二次的中点，不是第一次结束后的保持值 10。
+        let s = e.state_at(1250.0).unwrap();
+        assert!((s.x - 5.0).abs() < 1e-2, "second iteration spaced by End-Start");
     }
 
     #[test]

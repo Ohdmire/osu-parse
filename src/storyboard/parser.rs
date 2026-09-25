@@ -90,11 +90,23 @@ impl Cursor {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// 无节头的片段（测试和只含事件的 .osb）按 Events 解析。
+    Events,
+    Variables,
+    Other,
+}
+
 pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
     let mut sb = Storyboard::default();
     let mut cur = Cursor::new();
-    let mut in_events = true;
+    let mut section = Section::Events;
     let mut current_layer = Layer::Background;
+    // 无文件头时与 `LegacyStoryboardDecoder()` 一样用 LATEST_VERSION(14)，
+    // 不套用 v6 以前的动画帧间隔公式。
+    let mut version: i32 = 14;
+    let mut variables: Vec<(String, String)> = Vec::new();
 
     // .osu/.osb 常带 UTF-8 BOM 与 "osu file format vNN" 头行
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
@@ -102,7 +114,11 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
     for raw in input.lines() {
         let line = raw.trim_end_matches('\r');
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("osu file format") {
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("osu file format v") {
+            version = rest.trim().parse().unwrap_or(14);
             continue;
         }
 
@@ -122,19 +138,61 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
         if trimmed.starts_with('[') {
             let header = trimmed.to_ascii_lowercase();
             if header.starts_with("[events") {
-                in_events = true;
+                section = Section::Events;
                 cur.flush_into(&mut sb);
-            } else if in_events {
-                // Events 节结束
-                cur.flush_into(&mut sb);
-                in_events = false;
+            } else if header.starts_with("[variables") {
+                if section == Section::Events {
+                    cur.flush_into(&mut sb);
+                }
+                section = Section::Variables;
+            } else {
+                if section == Section::Events {
+                    cur.flush_into(&mut sb);
+                }
+                section = Section::Other;
             }
             continue;
         }
-        if !in_events {
-            // [General] 的宽屏标志（.osu），在任意节都可能出现
+        if section == Section::Variables {
+            // SplitKeyVal(line, '=', trim: false)：不裁掉键值两端空白。
+            if let Some((key, value)) = line.split_once('=') {
+                if !key.is_empty() {
+                    variables.push((key.to_string(), value.to_string()));
+                }
+            }
+            continue;
+        }
+        if section != Section::Events {
             if let Some(v) = trimmed.strip_prefix("WidescreenStoryboard:") {
                 sb.widescreen = Some(v.trim() == "1");
+            }
+            if let Some(v) = trimmed.strip_prefix("UseSkinSprites:") {
+                sb.use_skin_sprites = v.trim() == "1";
+            }
+            continue;
+        }
+
+        // decodeVariables：每个变量替换一次（替换结果里的 $ 不再展开）。
+        let expanded;
+        let line_ref: &str = if line.contains('$') {
+            expanded = variables.iter().fold(line.to_string(), |acc, (key, value)| acc.replace(key, value));
+            &expanded
+        } else {
+            line
+        };
+        // 行首空格和 '_' 都是命令深度（LegacyStoryboardDecoder.handleEvents）。
+        let (depth, body) = storyboard_depth(line_ref);
+        let trimmed = body.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            if let Some(rest) = trimmed.strip_prefix("//") {
+                let low = rest.trim().to_ascii_lowercase();
+                if let Some(after) = low.strip_prefix("storyboard layer ") {
+                    if let Some(d) = after.chars().next().and_then(|c| c.to_digit(10)) {
+                        if let Some(l) = Layer::from_token(&d.to_string()) {
+                            current_layer = l;
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -152,7 +210,7 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
                     cur.flush_into(&mut sb);
                     let is_animation = first_token == "6";
                     // 数字行的层/原点是位置参数(层是 0-4 的数字)
-                    match parse_element_line(&f, is_animation, Layer::Background) {
+                    match parse_element_line(&f, is_animation, Layer::Background, version) {
                         Ok((sprite, anim)) => {
                             cur.sprite = Some(sprite);
                             cur.is_animation = is_animation;
@@ -172,7 +230,7 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
                 }
                 "sprite" | "animation" => {
                     cur.flush_into(&mut sb);
-                    match parse_element_line(&f, first_token == "animation", current_layer) {
+                    match parse_element_line(&f, first_token == "animation", current_layer, version) {
                         Ok((sprite, anim)) => {
                             cur.sprite = Some(sprite);
                             cur.is_animation = first_token == "animation";
@@ -224,15 +282,17 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
                 "t" => {
                     if cur.sprite.is_some() {
                         cur.flush_group();
+                        // 缺省窗口是 MinValue..MaxValue（整段时间都 ActiveAt）。
+                        // 第 5 字段取负后是 GroupNumber，不是循环次数。
                         cur.group = Some(Group::Trigger(CommandTrigger {
                             trigger_name: f.get(1).cloned().unwrap_or_default(),
-                            start_time: f.get(2).and_then(|s| parse_f32(s)).unwrap_or(0.0),
+                            start_time: f.get(2).and_then(|s| parse_f32(s)).unwrap_or(f32::NEG_INFINITY),
                             end_time: f.get(3).and_then(|s| parse_f32(s)).unwrap_or(f32::INFINITY),
-                            total_iterations: f
+                            group_number: f
                                 .get(4)
-                                .and_then(|s| parse_f32(s))
-                                .map(|v| v.max(0.0) as u32)
-                                .unwrap_or(1),
+                                .and_then(|s| s.trim().parse::<i32>().ok())
+                                .map(|v| -v)
+                                .unwrap_or(0),
                             commands: Vec::new(),
                         }));
                     }
@@ -268,13 +328,26 @@ pub fn parse(input: &str) -> Result<Storyboard, ParseError> {
         }
 
         if let Some(cmd) = parse_command(trimmed, &mut sb.warnings) {
-            let indent = line.len() - line.trim_start().len();
-            cur.push_command(cmd, indent);
+            // depth < 2 结束当前 L/T 组，命令回到精灵顶层。
+            cur.push_command(cmd, depth);
         }
     }
 
     cur.flush_into(&mut sb);
     Ok(sb)
+}
+
+/// 行首连续的空格和 `_` 是故事板命令深度，其余才是正文。
+fn storyboard_depth(line: &str) -> (usize, &str) {
+    let mut depth = 0usize;
+    for (i, c) in line.char_indices() {
+        if c == ' ' || c == '_' {
+            depth += 1;
+        } else {
+            return (depth, &line[i..]);
+        }
+    }
+    (depth, "")
 }
 
 fn is_command_letter(tok: &str) -> bool {
@@ -286,6 +359,7 @@ fn parse_element_line(
     f: &[String],
     is_animation: bool,
     default_layer: Layer,
+    version: i32,
 ) -> Result<(Sprite, Option<(u32, f32, LoopType)>), String> {
     // 兼容两种形式：
     //   Sprite,layer,origin,path,x,y            （显式层）
@@ -316,7 +390,12 @@ fn parse_element_line(
     let mut anim = None;
     if is_animation {
         let frame_count = parse_f32(&f[i + 4]).unwrap_or(1.0).max(1.0) as u32;
-        let frame_delay = parse_f32(&f[i + 5]).unwrap_or(0.0).max(0.0);
+        let mut frame_delay = parse_f32(&f[i + 5]).unwrap_or(0.0).max(0.0);
+        // LegacyStoryboardDecoder：v6 以前的帧间隔按 stable 公式换算。
+        if version < 6 {
+            let rounded = (0.015 * f64::from(frame_delay)).round_ties_even();
+            frame_delay = (rounded * 1.186 * (1000.0 / 60.0)) as f32;
+        }
         let loop_type = f.get(i + 6).map(|s| LoopType::from_token(s)).unwrap_or(LoopType::LoopForever);
         anim = Some((frame_count, frame_delay, loop_type));
     }
@@ -484,6 +563,28 @@ mod tests {
     fn quoted_path_with_comma() {
         let sb = parse("Sprite,Centre,\"a,b.png\",10,20\n F,0,0,,1\n").unwrap();
         assert_eq!(sb.elements[0].sprite().path, "a,b.png");
+    }
+
+    #[test]
+    fn numeric_origins_follow_legacy_enum() {
+        let sb = parse("Sprite,0,3,\"a.png\",0,0\n F,0,0,,1\nSprite,0,9,\"b.png\",0,0\n F,0,0,,1\n").unwrap();
+        assert_eq!(sb.elements[0].sprite().origin, Origin::TopRight);
+        assert_eq!(sb.elements[1].sprite().origin, Origin::BottomRight);
+    }
+
+    #[test]
+    fn underscore_indent_stays_inside_the_loop() {
+        let sb = parse("Sprite,Centre,\"a.png\",0,0\n_L,0,2\n__F,0,0,100,0,1\n").unwrap();
+        let s = sb.elements[0].sprite();
+        assert_eq!(s.loops.len(), 1);
+        assert_eq!(s.loops[0].commands.len(), 1);
+        assert!(s.commands.is_empty());
+    }
+
+    #[test]
+    fn variables_substitute_once() {
+        let sb = parse("[Variables]\n$img=bg.jpg\n[Events]\nSprite,Background,Centre,\"$img\",0,0\n F,0,0,,1\n").unwrap();
+        assert_eq!(sb.elements[0].sprite().path, "bg.jpg");
     }
 
     #[test]

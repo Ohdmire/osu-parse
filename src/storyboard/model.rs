@@ -53,16 +53,17 @@ pub enum Origin {
 impl Origin {
     pub fn from_token(tok: &str) -> Option<Origin> {
         match tok.trim().to_ascii_lowercase().as_str() {
+            // 数字序号是 `LegacyOrigins` 的枚举序，不是名字的字母序。
             "topleft" | "0" => Some(Origin::TopLeft),
             "centre" | "center" | "1" => Some(Origin::Centre),
             "centreleft" | "centerleft" | "2" => Some(Origin::CentreLeft),
-            "centreright" | "centerright" => Some(Origin::CentreRight),
-            "topcentre" | "topcenter" | "3" => Some(Origin::TopCentre),
-            "topright" | "4" => Some(Origin::TopRight),
-            "bottomleft" | "5" => Some(Origin::BottomLeft),
-            "bottomcentre" | "bottomcenter" | "6" => Some(Origin::BottomCentre),
-            "bottomright" | "7" => Some(Origin::BottomRight),
-            "custom" | "8" => Some(Origin::Custom),
+            "topright" | "3" => Some(Origin::TopRight),
+            "bottomcentre" | "bottomcenter" | "4" => Some(Origin::BottomCentre),
+            "topcentre" | "topcenter" | "5" => Some(Origin::TopCentre),
+            "custom" | "6" => Some(Origin::Custom),
+            "centreright" | "centerright" | "7" => Some(Origin::CentreRight),
+            "bottomleft" | "8" => Some(Origin::BottomLeft),
+            "bottomright" | "9" => Some(Origin::BottomRight),
             _ => None,
         }
     }
@@ -196,15 +197,15 @@ pub struct CommandLoop {
     pub commands: Vec<Command>,
 }
 
-/// `T,triggerName,startTime,endTime` 命令触发器；仅在游戏事件触发时激活。
-/// 本渲染器解析并保留其信息（--list 可见数量），但不自动激活。
+/// `T,triggerName,startTime,endTime,groupNumber`。
+/// lazer `LegacyStoryboardDecoder` 把第 5 字段取负后存成 `GroupNumber`
+/// （stable 同款），缺省 0。命令时间相对触发时刻，只在窗口内触发。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // 字段保留用于未来手动激活触发器
 pub struct CommandTrigger {
     pub trigger_name: String,
     pub start_time: f32,
     pub end_time: f32,
-    pub total_iterations: u32,
+    pub group_number: i32,
     pub commands: Vec<Command>,
 }
 
@@ -270,6 +271,8 @@ pub struct Storyboard {
     pub samples: Vec<Sample>,
     /// .osu [General] 的 WidescreenStoryboard；None = 未知（纯 .osb），按宽屏处理。
     pub widescreen: Option<bool>,
+    /// `[General] UseSkinSprites: 1`。贴图先查当前皮肤，再查谱面文件。
+    pub use_skin_sprites: bool,
     /// 解析期间跳过/修正的内容（数量多时只打印前几条）。
     pub warnings: Vec<String>,
 }
