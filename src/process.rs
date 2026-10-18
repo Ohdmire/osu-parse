@@ -613,6 +613,7 @@ mod tests {
                 time: 0.0,
                 slider_velocity: 1.0,
                 generate_ticks: true,
+                effects: 0,
             }],
             objects: vec![
                 ParsedObject {

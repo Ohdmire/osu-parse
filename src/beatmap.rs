@@ -69,6 +69,8 @@ pub struct DifficultyPoint {
     pub time: f64,
     pub slider_velocity: f64,
     pub generate_ticks: bool,
+    /// Raw timing-line effects. Bit 0 is kiai.
+    pub effects: i32,
 }
 
 pub enum RawHitObject {
@@ -208,6 +210,7 @@ impl Beatmap {
             time: f64::NEG_INFINITY,
             slider_velocity: 1.0,
             generate_ticks: true,
+            effects: 0,
         })
     }
 }
@@ -552,10 +555,12 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
 
                 // Pending difficulty point; last one at the same timestamp wins.
                 pending_time = Some(time);
+                let effects = split.get(7).map(|s| parse_i32(s)).unwrap_or(0);
                 pending_diff = Some(DifficultyPoint {
                     time,
                     slider_velocity: speed_multiplier,
                     generate_ticks: !beat_length.is_nan(),
+                    effects,
                 });
             }
             "HitObjects" => {
@@ -676,7 +681,9 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
         let redundant = deduped
             .last()
             .map(|active| {
-                active.slider_velocity == pt.slider_velocity && active.generate_ticks == pt.generate_ticks
+                active.slider_velocity == pt.slider_velocity
+                    && active.generate_ticks == pt.generate_ticks
+                    && active.effects == pt.effects
             })
             .unwrap_or(false);
         if !redundant {
