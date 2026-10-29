@@ -154,7 +154,15 @@ pub struct Beatmap {
     pub difficulty_points: Vec<DifficultyPoint>,
     pub objects: Vec<ParsedObject>,
     /// Beatmap-defined combo colours from the `[Colours]` section (sRGB 0-255).
+    /// Only `Combo1`..`Combo8` count, matching
+    /// `LegacyDecoder.HandleColours` / `MAX_COMBO_COLOUR_COUNT`.
     pub combo_colours: Vec<[u8; 3]>,
+    /// `[Colours]` entries that are not `Combo1`..`Combo8` (`SliderBorder`,
+    /// `SliderTrackOverride`, `SliderBall`, `SpinnerBackground`, ...) in file
+    /// order - the `CustomColours` dictionary of `LegacyDecoder.HandleColours`.
+    /// Later duplicates win (dictionary assignment); use
+    /// [`Self::custom_colour`] for the lazer lookup.
+    pub custom_colours: Vec<(String, [u8; 3])>,
     /// `[Events]` break periods (`2,start,end`; end clamped to >= start),
     /// in file order - `LegacyBeatmapDecoder`'s `LegacyEventType.Break`.
     /// The health processor skips draining across these.
@@ -196,6 +204,16 @@ fn point_at<T: Copy>(points: &[T], t: f64, time_of: impl Fn(&T) -> f64) -> Optio
 }
 
 impl Beatmap {
+    /// `CustomColours[key]`: the last `[Colours]` line with this exact key
+    /// (lazer stores into a dictionary, so a later duplicate overwrites).
+    pub fn custom_colour(&self, key: &str) -> Option<[u8; 3]> {
+        self.custom_colours
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, rgb)| *rgb)
+    }
+
     pub fn timing_point_at(&self, t: f64) -> TimingPoint {
         // ControlPointInfo.TimingPointAt falls back to the FIRST timing point
         // (even if it starts after `t`), else the default (BeatLength 1000).
@@ -424,6 +442,7 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
     let mut difficulty_points: Vec<DifficultyPoint> = Vec::new();
     let mut objects: Vec<ParsedObject> = Vec::new();
     let mut combo_colours: Vec<[u8; 3]> = Vec::new();
+    let mut custom_colours: Vec<(String, [u8; 3])> = Vec::new();
     let mut breaks: Vec<(f64, f64)> = Vec::new();
     let mut general = GeneralInfo::default();
     // Online IDs default to lazer's "unknown" -1 when the lines are absent.
@@ -585,21 +604,27 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
                 last_object_is_spinner = is_spinner;
             }
             "Colours" => {
-                // "Combo1 : 255,128,64" (also "Combo" without number).
+                // "Combo1 : 255,128,64" / "SliderBorder : 255,255,255".
+                // `LegacyDecoder.HandleColours`: only `Combo1`..`Combo8` are
+                // combo colours; everything else (including `Combo` without a
+                // number and `Combo9+`) goes to the custom-colour dictionary.
+                // A 4th component (alpha) is accepted and ignored: beatmap
+                // decoding passes `allowAlpha: false`, which keeps alpha 255.
                 let (key, value) = split_kv(&line);
-                // Split at the first digit to get the alphabetic prefix
-                // ("Combo1" / "Combo2" -> "Combo"); splitting at non-digits
-                // would yield an empty first segment for letter-led keys.
-                let key = key.split(|c: char| c.is_ascii_digit()).next().unwrap_or("").trim().to_string();
-                if key == "Combo" {
-                    let parts: Vec<&str> = value.split(',').collect();
-                    if parts.len() >= 3 {
-                        let rgb = [
-                            parse_i32(parts[0]).clamp(0, 255) as u8,
-                            parse_i32(parts[1]).clamp(0, 255) as u8,
-                            parse_i32(parts[2]).clamp(0, 255) as u8,
-                        ];
+                let parts: Vec<&str> = value.split(',').collect();
+                if parts.len() >= 3 {
+                    let rgb = [
+                        parse_i32(parts[0]).clamp(0, 255) as u8,
+                        parse_i32(parts[1]).clamp(0, 255) as u8,
+                        parse_i32(parts[2]).clamp(0, 255) as u8,
+                    ];
+                    let combo_index = key
+                        .strip_prefix("Combo")
+                        .and_then(|rest| rest.parse::<i32>().ok());
+                    if matches!(combo_index, Some(1..=8)) {
                         combo_colours.push(rgb);
+                    } else {
+                        custom_colours.push((key, rgb));
                     }
                 }
             }
@@ -654,6 +679,25 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
         return Err(format!("only osu!standard beatmaps are supported (mode {})", mode));
     }
 
+    // `LegacyBeatmapDecoder.postProcessBreaks`: the first hit object after a
+    // break starts a new combo. Both lists are walked in file order (lazer
+    // does not sort breaks), and the pending flag survives objects that
+    // already start a combo.
+    if !breaks.is_empty() {
+        let mut current_break = 0usize;
+        let mut force_new_combo = false;
+        for obj in &mut objects {
+            while current_break < breaks.len() && breaks[current_break].1 < obj.start_time {
+                force_new_combo = true;
+                current_break += 1;
+            }
+            if force_new_combo && !obj.new_combo {
+                obj.new_combo = true;
+                force_new_combo = false;
+            }
+        }
+    }
+
     // AR defaults to OD when missing.
     if !has_approach_rate {
         difficulty.ar = difficulty.od;
@@ -706,6 +750,7 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
         difficulty_points,
         objects,
         combo_colours,
+        custom_colours,
         breaks,
         general,
         metadata,
@@ -925,5 +970,70 @@ mod tests {
         assert!(map.background.is_none());
         assert!(map.video.is_none());
         assert!(map.sample_data.points.is_empty());
+    }
+
+    #[test]
+    fn break_forces_new_combo_on_next_object() {
+        // `postProcessBreaks`: the first object AFTER the break's end starts a
+        // new combo; an object inside the break does not.
+        let map = decode(
+            "osu file format v14\n\
+             [Events]\n\
+             2,1000,2000\n\
+             [HitObjects]\n\
+             256,192,500,1,0\n\
+             256,192,1500,1,0\n\
+             256,192,2500,1,0\n",
+        )
+        .unwrap();
+
+        assert!(map.objects[0].new_combo); // first object
+        assert!(!map.objects[1].new_combo); // inside the break
+        assert!(map.objects[2].new_combo); // first object after the break
+    }
+
+    #[test]
+    fn break_new_combo_skips_an_object_that_already_starts_one() {
+        // The pending flag survives a `new combo` bit and lands on the next
+        // object that does not already start a combo (lazer's `if (forceNewCombo
+        // && !h.NewCombo)`).
+        let map = decode(
+            "osu file format v14\n\
+             [Events]\n\
+             2,1000,2000\n\
+             [HitObjects]\n\
+             256,192,2500,5,0\n\
+             256,192,2600,1,0\n",
+        )
+        .unwrap();
+
+        assert!(map.objects[0].new_combo); // already new (combo flag bit 2)
+        assert!(map.objects[1].new_combo); // forced by the break
+    }
+
+    #[test]
+    fn colours_split_combo_and_custom_like_lazer() {
+        let map = decode(
+            "osu file format v14\n\
+             [Colours]\n\
+             Combo1 : 255,0,0\n\
+             Combo9 : 0,255,0\n\
+             Combo : 70,80,90\n\
+             SliderBorder : 10,20,30\n\
+             SliderTrackOverride : 40,50,60\n\
+             SliderBorder : 1,2,3\n\
+             [HitObjects]\n\
+             256,192,1000,1,0\n",
+        )
+        .unwrap();
+
+        // Only Combo1..Combo8 are combo colours; Combo9 and bare Combo are
+        // custom colours (lazer's `isCombo` check).
+        assert_eq!(map.combo_colours, vec![[255, 0, 0]]);
+        assert_eq!(map.custom_colour("Combo9"), Some([0, 255, 0]));
+        assert_eq!(map.custom_colour("Combo"), Some([70, 80, 90]));
+        assert_eq!(map.custom_colour("SliderBorder"), Some([1, 2, 3])); // last wins
+        assert_eq!(map.custom_colour("SliderTrackOverride"), Some([40, 50, 60]));
+        assert_eq!(map.custom_colour("SliderBall"), None);
     }
 }
