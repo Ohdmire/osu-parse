@@ -274,11 +274,18 @@ fn parse_bool(s: &str) -> Option<bool> {
 }
 
 /// Stable-format coordinate parsing: `(int)Parsing.ParseFloat(x)`.
+///
+/// Deliberately *not* clamped to `Parsing.MAX_COORDINATE_VALUE` (±131072):
+/// lazer throws on out-of-range vertices, and clamping instead collapses
+/// their geometry (a 1.04e9 px Aspire slider shrinks to ~7.9e5 px, i.e. a
+/// 9 s slider becomes a 7 ms one). Keeping the authored value is what makes
+/// a "complete" parse possible; consumers that need lazer parity can range
+/// check themselves.
 fn parse_coord(s: &str, lazer_format: bool) -> f32 {
     if lazer_format {
-        parse_f32(s).clamp(-131072.0, 131072.0)
+        parse_f32(s)
     } else {
-        parse_f32(s).clamp(-131072.0, 131072.0) as i32 as f32
+        parse_f32(s) as i32 as f32
     }
 }
 
@@ -498,7 +505,9 @@ pub fn decode(content: &str) -> Result<Beatmap, String> {
                     }
                     "Countdown" => general.countdown = Some(parse_f64(&value)),
                     "SampleSet" => general.sample_set = Some(value),
-                    "SampleVolume" => general.sample_volume = Some(parse_i32(&value).clamp(0, 100)),
+                    // No 0..100 clamp: lazer stores this field raw and only
+                    // the per-point `SampleVolume` bindable clamps.
+                    "SampleVolume" => general.sample_volume = Some(parse_i32(&value)),
                     "LetterboxInBreaks" => general.letterbox_in_breaks = parse_bool(&value),
                     "WidescreenStoryboard" => general.widescreen_storyboard = parse_bool(&value),
                     "SkinPreference" => general.skin_preference = Some(value),
@@ -836,10 +845,11 @@ fn parse_hit_object_line(
         RawHitObject::Circle { pos }
     } else if obj_type & (1 << 1) != 0 {
         // Slider
+        // NOTE: lazer rejects `repeatCount > 9000` ("Repeat count is way too
+        // high"); that cap is not applied here so extreme Aspire maps parse
+        // completely. The count is still bounded by `i32` (the field's type)
+        // and by whatever the consumer can afford to simulate.
         let mut repeat_count = parse_i32(split[6]);
-        if repeat_count > 9000 {
-            return Err("Repeat count is way too high".to_string());
-        }
         repeat_count = (repeat_count - 1).max(0);
 
         let mut length: Option<f64> = None;
@@ -1035,5 +1045,46 @@ mod tests {
         assert_eq!(map.custom_colour("SliderBorder"), Some([1, 2, 3])); // last wins
         assert_eq!(map.custom_colour("SliderTrackOverride"), Some([40, 50, 60]));
         assert_eq!(map.custom_colour("SliderBall"), None);
+    }
+
+    #[test]
+    fn coordinates_are_not_clamped_to_lazers_max() {
+        // lazer rejects vertices outside `Parsing.MAX_COORDINATE_VALUE`
+        // (±131072) and osu-parse used to clamp them, which collapses the
+        // geometry (a 1.04e9 px Aspire slider became ~7.9e5 px, i.e. 9 s
+        // turned into 7 ms). The authored value must survive parsing.
+        let map = decode(
+            "osu file format v14\n\
+             [HitObjects]\n\
+             430,174,1000,6,0,L|31457196:20|71:110382,1,1044625950.75\n",
+        )
+        .unwrap();
+
+        match &map.objects[0].raw {
+            RawHitObject::Slider { pos, path, .. } => {
+                assert_eq!((pos.x, pos.y), (430.0, 174.0));
+                // Control points are relative to the head.
+                assert_eq!(path.control_points[1].position.x, 31_456_766.0);
+                assert_eq!(path.control_points[2].position.y, 110_208.0);
+            }
+            _ => panic!("expected slider"),
+        }
+    }
+
+    #[test]
+    fn repeat_count_above_lazer_limit_still_parses() {
+        // lazer throws "Repeat count is way too high" above 9000; that cap is
+        // not applied so extreme maps parse completely.
+        let map = decode(
+            "osu file format v14\n\
+             [HitObjects]\n\
+             256,192,1000,6,0,L|300:192,9001,100\n",
+        )
+        .unwrap();
+
+        match &map.objects[0].raw {
+            RawHitObject::Slider { repeat_count, .. } => assert_eq!(*repeat_count, 9000),
+            _ => panic!("expected slider"),
+        }
     }
 }
